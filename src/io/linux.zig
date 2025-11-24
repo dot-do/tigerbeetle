@@ -848,6 +848,7 @@ pub const IO = struct {
             socket: socket_t,
             buffer: []u8,
         },
+        recvmsg: struct { hdr: posix.msghdr },
         send: struct {
             socket: socket_t,
             buffer: []const u8,
@@ -1118,6 +1119,36 @@ pub const IO = struct {
             context: Context,
             completion: *Completion,
             result: RecvError!usize,
+        ) void,
+        completion: *Completion,
+        socket: socket_t,
+        buffer: []u8,
+    ) void {
+        completion.* = .{
+            .io = self,
+            .context = context,
+            .callback = erase_types(Context, RecvError!usize, callback),
+            .operation = .{
+                .recv = .{
+                    .socket = socket,
+                    .buffer = buffer,
+                },
+            },
+        };
+        self.enqueue(completion);
+    }
+
+    pub fn recv_msg(
+        self: *IO,
+        comptime Context: type,
+        context: Context,
+        comptime callback: fn (
+            context: Context,
+            completion: *Completion,
+            result: RecvError!struct {
+                size: usize,
+                address: std.net.Address,
+            },
         ) void,
         completion: *Completion,
         socket: socket_t,

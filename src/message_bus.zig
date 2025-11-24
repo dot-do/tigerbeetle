@@ -1,3 +1,4 @@
+
 const std = @import("std");
 const assert = std.debug.assert;
 const mem = std.mem;
@@ -14,6 +15,8 @@ const MessagePool = @import("message_pool.zig").MessagePool;
 const Message = MessagePool.Message;
 const MessageBuffer = @import("./message_buffer.zig").MessageBuffer;
 const QueueType = @import("./queue.zig").QueueType;
+const IOPSType = @import("./iops.zig").IOPSType;
+const Timeout = vsr.Timeout;
 
 pub fn MessageBusType(comptime IO: type) type {
     // Slice points to a subslice of send_queue_buffer.
@@ -1184,5 +1187,160 @@ pub fn MessageBusType(comptime IO: type) type {
             /// For connections_suspended.
             link: QueueType(Connection).Link = .{},
         };
+    };
+}
+
+fn DiscoveryType(IO: type) type {
+    return struct {
+        io: *IO,
+        prng: stdx.PRNG,
+
+        address: [constants.discovery_addresses_max]Address,
+        address_ttl: [constants.discovery_addresses_max]u32,
+        address_count_max: u32,
+
+        replicas: [constants.members_max]Address, 
+
+        send_completion: IOPSType(IO.Completion, constants.discovery_concurrency),
+        recv_completion: IO.Completion,
+        recv_buffer: *[discovery_message_size_max]u8,
+        timeout: Timeout,
+
+        const discovery_message_size_max = @sizeOf(vsr.Header) +
+            (constants.members_max * (@sizeOf(u128) + @sizeOf(u16)));
+
+        const ttl_forever = std.math.intMax(u32);
+        const ttl_initial = @divFloor(5 * std.time.ms_per_min, constants.tick_ms);
+
+        const Address = struct {
+            ip: u128,
+            port: u16,
+        };
+
+        const Discovery = @This();
+
+        pub fn tick(discovery: *Discovery) void {
+            for (*discovery.address_ttl) |*ttl| {
+                if (ttl.* == ttl_forever) continue; // Pre-configured address.
+                ttl.* -|= 1;
+            }
+            discovery.timeout.tick();
+            if (discovery.timeout.fired()) {
+                discovery.timeout.reset();
+                discovery.broadcast();
+            }
+        }
+
+        pub fn broadcast(discovery: *Discovery) void {
+            var permutation: [constants.discovery_addresses_max]u8 = 0;
+            for (&permutation, 0..) |p, index| p.* = @intCast(index);
+
+            discovery.prng.shuffle(u8, &permutation);
+
+            var header: vsr.Header = .{
+                .checksum_body = comptime vsr.checksum(&.{}),
+            };
+            header.set_checksum();
+
+            for (permutation) |index| {
+                if (discovery.address_ttl[index] > 0) {
+                    const address = discovery.addresses[index];
+                    const completion = discovery.send_completion.acquire() orelse
+                        return;
+                    discovery.io.send_msg(
+                        *Discovery,
+                        discovery,
+                        broadcast_send_callback,
+                        completion,
+                        discovery.socket,
+                        address,
+                        std.mem.asBytes(&header),
+                    );
+                }
+            }
+        }
+
+        fn broadcast_send_callback(
+            discovery: *Discovery,
+            completion: *IO.Completion,
+            result: IO.SendError!usize,
+        ) void {
+            discovery.send_completion.release(completion);
+            const send_size = result catch |err| {
+                log.err("send_msg: error={s}", .{@errorName(err)});
+                return;
+            };
+            if (send_size != @sizeOf(vsr.Header)) {
+                log.err("send_msg: unexpected size ({}!={})", .{ send_size, @sizeOf(vsr.Header) });
+            }
+        }
+
+        fn recv(discovery: *Discovery) void {
+            discovery.io.recv_msg(
+                *Discovery,
+                discovery,
+                recv_callback,
+                &discovery.recv_completion,
+                discovery.socket,
+                discovery.recv_buffer,
+            );
+        }
+
+        fn recv_callback(
+            discovery: *Discovery,
+            completion: *IO.Completion,
+            result_or_error: IO.RecvError!IO.RecvMsgResult,
+        ) void {
+            assert(completion == &discovery.recv_completion);
+            const result = result_or_error catch |err| {
+                log.err("recv_callback: err={s}", .{@errorName(err)});
+                return;
+            };
+            assert(result.size <= discovery_message_size_max);
+            assert(result.size >= @sizeOf(vsr.Header));
+            const header = std.mem.bytesAsValue(
+                vsr.Header,
+                discovery.recv_buffer[0..@sizeOf(vsr.Header)],
+            );
+            assert(header.valid_checksum());
+            assert(result.size == header.size);
+
+            if (header.size == @sizeOf(vsr.Header)) {
+                assert(header.replica < discovery.replica_count);
+                discovery.replica_addresses[header.replica] = result.address;
+            } else {
+                const address_count = @divExact(
+                    header.size - @sizeOf(vsr.Header),
+                    @sizeOf(u128) + @sizeOf(u16),
+                );
+                const addresses: []u128 = undefined;
+                const ports: []u16 = undefined;
+                for (addresses, ports) |address_new, port_new| {
+                    var ttl_min: u32 = ttl_forever;
+                    var ttl_min_index: ?usize = null;
+                    for (discovery.address, &discovery.address_ttl, 0..) |address, *ttl, index| {
+                        if (address.ip == address_new and address.port == address.port) {
+                            if (ttl.* == ttl_forever) {
+                                //
+                            } else {
+                                assert(ttl.* <= ttl_initial);
+                                ttl.* = ttl_initial;
+                            }
+                            break;
+                        }
+                        if (ttl.* < ttl_min) {
+                            ttl_min = ttl.*;
+                            ttl_min_index = index;
+                        }
+                    } else {
+                        assert(ttl_min_index != null);
+                        assert(ttl_min < ttl_forever);
+                        assert(discovery.address_ttl[])
+                        discovery.address[ttl_min_index.?] = address_new;
+                        discovery.address_tll[ttl_min_index.?] = ttl_initial;
+                    }
+                }
+            }
+        }
     };
 }
