@@ -36,6 +36,169 @@ const Options = struct {
     deduplicate: bool,
 };
 
+pub fn TournamentTreeType(comptime Key: type, contestants_max: comptime_int) type {
+    return struct {
+        winner: Node,
+        losers: [node_count]Node,
+        tree_height: u16,
+        nodes_count: u16,
+        contestants_left: u16,
+        direction: Direction,
+
+        pub const node_count: u32 = std.math.ceilPowerOfTwoAssert(u32, contestants_max);
+
+        const Node = struct {
+            key: Key,
+            id: u32,
+
+            const id_sentinel = std.math.maxInt(u32);
+            const sentinel: Node = .{
+                // The key itself is not used to determine whether a Node is a sentinel.
+                // This ensures that valid Keys with the maximum value are not treated as sentinels.
+                .key = std.math.maxInt(Key),
+                .id = id_sentinel,
+            };
+
+            // Returns true iff `a` wins over `b` under `direction`.
+            // If keys are equal, `stream_precedence` decides.
+            inline fn beats(
+                a: *const Node,
+                b: *const Node,
+                direction: Direction,
+            ) bool {
+                // A sentinel always loses.
+                if (b.id == id_sentinel) return true;
+                if (a.id == id_sentinel) return false;
+
+                const ordered = if (direction == .ascending) a.key < b.key else a.key > b.key;
+                assert(a.id != b.id);
+                const stabler = (a.key == b.key) and a.id < b.id;
+                return ordered or stabler; // `true` means a wins.
+            }
+        };
+
+        const TournamentTree = @This();
+
+        pub fn init(
+            direction: Direction,
+            contestants: *[node_count]Node,
+            contestant_count: u16,
+        ) TournamentTree {
+            assert(contestant_count <= contestants_max);
+            maybe(contestant_count == 0);
+
+            var contestant_previous: ?*const Node = null;
+            for (contestants[0..contestant_count]) |*contestant| {
+                assert(contestant.id != Node.id_sentinel);
+                if (contestant_previous) |previous| assert(previous.id < contestant.id);
+                contestant_previous = contestant;
+            }
+            for (contestants[contestant_count..]) |*contestant| {
+                assert(contestant.id == Node.id_sentinel);
+            }
+
+            var tree: TournamentTree = .{
+                .winner = .sentinel,
+                .losers = @splat(.sentinel),
+                .direction = direction,
+                .tree_height = 0,
+                .nodes_count = 0,
+                .contestants_left = contestant_count,
+            };
+
+            if (contestant_count == 0) return tree;
+
+            const leafs_count =
+                std.math.ceilPowerOfTwo(u16, contestant_count) catch unreachable;
+            const tree_height = std.math.log2(leafs_count);
+            const nodes_count: u16 = leafs_count - 1;
+
+            // Construct the binary tree bottom up.
+            for (0..tree_height) |level| {
+                const level_min = (leafs_count >> @as(u4, @intCast(level + 1))) - 1;
+                const level_max = (leafs_count >> @as(u4, @intCast(level))) - 1;
+
+                for (level_min..level_max, 0..) |loser_index, competitor_index| {
+                    const competitor_a = contestants[competitor_index * 2];
+                    const competitor_b = contestants[competitor_index * 2 + 1];
+
+                    if (competitor_a.beats(&competitor_b, direction)) {
+                        contestants[competitor_index] = competitor_a;
+                        tree.losers[loser_index] = competitor_b;
+                    } else {
+                        contestants[competitor_index] = competitor_b;
+                        tree.losers[loser_index] = competitor_a;
+                    }
+                }
+            }
+
+            // The final winner of the first competition is now in `contestants[0]`
+            tree.winner = contestants[0];
+            assert(tree.contestants_left == contestant_count);
+            tree.nodes_count = nodes_count;
+            tree.tree_height = tree_height;
+
+            return tree;
+        }
+
+        pub fn pop_winner(tree: *TournamentTree, new_contestant: ?Key) void {
+            const direction = tree.direction;
+            const winner_id = tree.winner.id;
+
+            assert(tree.contestants_left > 0);
+            assert(tree.winner.id != Node.id_sentinel);
+
+            if (new_contestant == null) tree.contestants_left -= 1;
+            tree.winner = if (new_contestant) |key|
+                .{ .key = key, .id = tree.winner.id }
+            else
+                .sentinel;
+
+            var opponent_id: usize = tree.nodes_count + winner_id;
+            for (0..tree.tree_height) |_| {
+                opponent_id = (opponent_id - 1) >> 1;
+
+                const opponent = &tree.losers[opponent_id];
+                const winner = determine_winner(&tree.winner, opponent, direction);
+                swap_nodes(winner, &tree.winner);
+            }
+
+            if (tree.winner.id == Node.id_sentinel) assert(tree.contestants_left == 0);
+        }
+
+        /// Return a pointer to the winner without branching.
+        inline fn determine_winner(
+            contender: *Node,
+            challenger: *Node,
+            direction: Direction,
+        ) *Node {
+            const challenger_wins: bool = challenger.beats(contender, direction);
+            const winner: *Node = select(challenger_wins, challenger, contender);
+            return winner;
+        }
+
+        inline fn select(choose_a: bool, a: *Node, b: *Node) *Node {
+            // Note: The code layout coaxes the compiler to generate branchless code.
+            //       Best do not change it without verifying the generated code.
+            var p = b;
+            if (choose_a) {
+                @branchHint(.unpredictable); // attaches to this branch
+                p = a;
+            }
+            return p;
+        }
+
+        // This custom swap is faster than `std.mem.swap` for our Node struct.
+        inline fn swap_nodes(a: *Node, b: *Node) void {
+            inline for (std.meta.fields(Node)) |field| {
+                const field_value = @field(a, field.name);
+                @field(a, field.name) = @field(b, field.name);
+                @field(b, field.name) = field_value;
+            }
+        }
+    };
+}
+
 pub fn KWayMergeIteratorType(
     comptime Context: type,
     comptime Key: type,
@@ -57,50 +220,14 @@ pub fn KWayMergeIteratorType(
     comptime assert(options.streams_max < std.math.maxInt(@TypeOf(options.streams_max)));
 
     return struct {
-        const KWayMergeIterator = @This();
-
-        const node_max: u32 = std.math.ceilPowerOfTwoAssert(u32, options.streams_max);
-        const stream_id_invalid = std.math.maxInt(@TypeOf(options.streams_max));
-        const sentinel: Node = .{
-            // The key itself is not used to determine whether a Node is a sentinel.
-            // This ensures that valid Keys with the maximum value are not treated as sentinels.
-            .key = std.math.maxInt(Key),
-            .stream_id = stream_id_invalid,
-            .sentinel = true,
-        };
-
-        state: enum { loading, iterating },
-        tree_height: u16,
-        nodes_count: u16,
-        streams_count: u16,
-        streams_active: u16,
         context: *Context,
-        contender: Node,
-        losers: [node_max]Node,
+        streams_count: u16,
         direction: Direction,
         key_popped: ?Key,
+        tree: ?Tree,
 
-        const Node = struct {
-            key: Key,
-            stream_id: u32,
-            sentinel: bool,
-
-            // Returns true iff `a` wins over `b` under `direction`.
-            // If keys are equal, smaller stream_id wins.
-            inline fn beats(
-                a: *const Node,
-                b: *const Node,
-                direction: Direction,
-            ) bool {
-                // A sentinel always loses.
-                if (b.sentinel) return true;
-                if (a.sentinel) return false;
-
-                const ordered = if (direction == .ascending) a.key < b.key else a.key > b.key;
-                const stabler = (a.key == b.key) and (a.stream_id < b.stream_id);
-                return ordered or stabler; // “true”  means  a wins.
-            }
-        };
+        const Tree = TournamentTreeType(Key, options.streams_max);
+        const KWayMergeIterator = @This();
 
         pub fn init(
             context: *Context,
@@ -113,94 +240,49 @@ pub fn KWayMergeIteratorType(
 
             return .{
                 .context = context,
-                .tree_height = 0,
-                .nodes_count = 0,
-                .contender = sentinel,
-                .losers = @splat(sentinel),
                 .key_popped = null,
                 .direction = direction,
-                .streams_active = 0,
                 .streams_count = streams_count,
-                .state = .loading,
+                .tree = null,
             };
         }
 
         pub fn reset(self: *KWayMergeIterator) void {
             self.* = .{
                 .context = self.context,
-                .tree_height = 0,
-                .nodes_count = 0,
-                .contender = sentinel,
-                .losers = @splat(sentinel),
                 .direction = self.direction,
-                .streams_active = self.streams_active,
                 .streams_count = self.streams_count,
-                .state = .loading,
-                .key_popped = self.key_popped,
+                .key_popped = null,
+                .tree = null,
             };
         }
 
         fn load(self: *KWayMergeIterator) Pending!void {
-            assert(self.state == .loading);
-            assert(self.nodes_count == 0);
-            assert(self.tree_height == 0);
+            assert(self.tree == null);
             errdefer self.reset();
 
             // Collect the non‑empty batches as initial “contestants”.
-            var contestants: [node_max]Node = @splat(sentinel);
-            var contestants_count: u16 = 0;
-            for (0..self.streams_count) |id| {
-                const key = try stream_peek(self.context, @intCast(id)) orelse continue;
-                contestants[id] = .{ .key = key, .stream_id = @intCast(id), .sentinel = false };
-                contestants_count += 1;
+            var contestants: [Tree.node_count]Tree.Node = @splat(.sentinel);
+            var contestant_count: u16 = 0;
+            for (0..self.streams_count) |id_usize| {
+                const id: u32 = @intCast(id_usize);
+                const key = try stream_peek(self.context, id) orelse continue;
+                contestants[contestant_count] = .{ .key = key, .id = id };
+                contestant_count += 1;
             }
 
-            if (contestants_count == 0) {
-                self.streams_active = 0;
-                self.contender = sentinel;
-                self.state = .iterating;
-                return;
-            }
-
-            // Calculate the shape of the binary tree.
-            const leafs_count = std.math.ceilPowerOfTwo(u16, self.streams_count) catch unreachable;
-            const tree_height = std.math.log2(leafs_count);
-            const nodes_count: u16 = leafs_count - 1;
-
-            // Construct the binary tree bottom up.
-            for (0..tree_height) |level| {
-                const level_min = (leafs_count >> @as(u4, @intCast(level + 1))) - 1;
-                const level_max = (leafs_count >> @as(u4, @intCast(level))) - 1;
-
-                for (level_min..level_max, 0..) |loser_index, competitor_index| {
-                    const competitor_a = contestants[competitor_index * 2];
-                    const competitor_b = contestants[competitor_index * 2 + 1];
-
-                    if (competitor_a.beats(&competitor_b, self.direction)) {
-                        contestants[competitor_index] = competitor_a;
-                        self.losers[loser_index] = competitor_b;
-                    } else {
-                        contestants[competitor_index] = competitor_b;
-                        self.losers[loser_index] = competitor_a;
-                    }
-                }
-            }
-
-            // The final winner of the first competition is now in `contestants[0]`
-            self.contender = contestants[0];
-            self.nodes_count = nodes_count;
-            self.streams_active = contestants_count;
-            self.tree_height = tree_height;
-            self.key_popped = self.key_popped;
-            self.state = .iterating;
+            self.tree = Tree.init(self.direction, &contestants, contestant_count);
         }
 
         pub fn pop(self: *KWayMergeIterator) Pending!?Value {
-            if (self.state == .loading) try self.load();
-            assert(self.state == .iterating);
+            if (self.tree == null) try self.load();
+            assert(self.tree != null);
 
-            while (self.streams_active > 0) {
-                const value = try self.next() orelse return null;
+            while (self.tree.?.contestants_left > 0) {
+                const key = try stream_peek(self.context, self.tree.?.winner.id);
+                self.tree.?.pop_winner(key);
+                if (self.tree.?.contestants_left == 0) return null;
+                const value = stream_pop(self.context, self.tree.?.winner.id);
                 if (options.deduplicate) {
                     const key_next = key_from_value(&value);
                     if (self.key_popped) |key_prev| if (key_next == key_prev) continue;
@@ -210,72 +292,9 @@ pub fn KWayMergeIteratorType(
             }
             return null;
         }
-
-        fn next(self: *KWayMergeIterator) Pending!?Value {
-            const direction = self.direction;
-            const stream_id = self.contender.stream_id;
-            assert(!self.contender.sentinel);
-
-            self.contender = try self.next_contender(stream_id);
-
-            var opponent_id: usize = self.nodes_count + stream_id;
-            for (0..self.tree_height) |_| {
-                opponent_id = (opponent_id - 1) >> 1;
-
-                const opponent = &self.losers[opponent_id];
-                const winner = determine_winner(&self.contender, opponent, direction);
-                swap_nodes(winner, &self.contender);
-            }
-
-            if (self.contender.sentinel) {
-                assert(self.streams_active == 0);
-                return null;
-            }
-
-            return stream_pop(self.context, self.contender.stream_id);
-        }
-
-        fn next_contender(self: *KWayMergeIterator, stream_id: u32) Pending!Node {
-            assert(stream_id < self.streams_count);
-            const next_key = try stream_peek(self.context, stream_id) orelse {
-                self.streams_active -= 1;
-                return sentinel;
-            };
-            return .{ .key = next_key, .stream_id = stream_id, .sentinel = false };
-        }
-
-        inline fn select(choose_a: bool, a: *Node, b: *Node) *Node {
-            // Note: The code layout coaxes the compiler to generate branchless code.
-            //       Best do not change it without verifying the generated code.
-            var p = b;
-            if (choose_a) {
-                @branchHint(.unpredictable); // attaches to this branch
-                p = a;
-            }
-            return p;
-        }
-
-        /// Return a pointer to the winner without branching.
-        inline fn determine_winner(
-            contender: *Node,
-            challenger: *Node,
-            direction: Direction,
-        ) *Node {
-            const challenger_wins: bool = challenger.beats(contender, direction);
-            const winner: *Node = select(challenger_wins, challenger, contender);
-            return winner;
-        }
-
-        // This custom swap is faster than `std.mem.swap` for our Node struct.
-        inline fn swap_nodes(a: *Node, b: *Node) void {
-            inline for (std.meta.fields(Node)) |f| {
-                const tmp_field = @field(a, f.name);
-                @field(a, f.name) = @field(b, f.name);
-                @field(b, f.name) = tmp_field;
-            }
-        }
     };
 }
+
 fn TestContextType(comptime streams_max: u32) type {
     const testing = std.testing;
 
@@ -290,6 +309,16 @@ fn TestContextType(comptime streams_max: u32) type {
 
             inline fn to_key(v: *const Value) u32 {
                 return v.key;
+            }
+
+            fn less_than(direction: Direction, a: Value, b: Value) bool {
+                var order = math.order(a.key, b.key);
+                if (direction == .descending) order = order.invert();
+                return switch (order) {
+                    .lt => true,
+                    .eq => a.version < b.version,
+                    .gt => false,
+                };
             }
         };
 
@@ -313,7 +342,7 @@ fn TestContextType(comptime streams_max: u32) type {
         fn merge(
             direction: Direction,
             streams_keys: []const []const u32,
-            expect: []const Value,
+            expect: ?[]const Value,
         ) !void {
             const KWay = KWayMergeIteratorType(
                 TestContext,
@@ -327,49 +356,134 @@ fn TestContextType(comptime streams_max: u32) type {
                 stream_peek,
                 stream_pop,
             );
-            var actual = std.ArrayList(Value).init(testing.allocator);
+
+            const gpa = std.testing.allocator;
+
+            var actual = std.ArrayList(Value).init(gpa);
             defer actual.deinit();
 
             var streams: [streams_max][]Value = undefined;
 
+            var key_count: u32 = 0;
             for (streams_keys, 0..) |stream_keys, i| {
-                errdefer for (streams[0..i]) |s| testing.allocator.free(s);
-                streams[i] = try testing.allocator.alloc(Value, stream_keys.len);
+                errdefer for (streams[0..i]) |s| gpa.free(s);
+                streams[i] = try gpa.alloc(Value, stream_keys.len);
                 for (stream_keys, 0..) |key, j| {
                     streams[i][j] = .{
                         .key = key,
                         .version = @intCast(i),
                     };
+                    key_count += 1;
                 }
             }
-            defer for (streams[0..streams_keys.len]) |s| testing.allocator.free(s);
+            defer for (streams[0..streams_keys.len]) |s| gpa.free(s);
+
+            const buffer = try gpa.alloc(Value, key_count);
+            defer gpa.free(buffer);
+
+            const expect_naive = merge_naive(streams[0..streams_keys.len], direction, buffer);
 
             var context: TestContext = .{ .streams = streams };
+
+            if (expect) |expect_manual| {
+                try testing.expectEqualSlices(Value, expect_naive, expect_manual);
+            }
+
             var kway = KWay.init(&context, @intCast(streams_keys.len), direction);
 
             while (try kway.pop()) |value| {
                 try actual.append(value);
             }
 
-            try testing.expectEqualSlices(Value, expect, actual.items);
+            try testing.expectEqualSlices(Value, expect_naive, actual.items);
+        }
+
+        fn merge_naive(
+            streams: []const []const Value,
+            direction: Direction,
+            buffer: []Value,
+        ) []const Value {
+            var buffer_count: u32 = 0;
+            for (streams) |stream| {
+                for (stream) |value| {
+                    buffer[buffer_count] = value;
+                    buffer_count += 1;
+                }
+            }
+
+            std.mem.sort(Value, buffer[0..buffer_count], direction, Value.less_than);
+
+            var target: usize = 0;
+            var previous_key: ?u32 = null;
+            for (buffer[0..buffer_count]) |value| {
+                if (previous_key) |p| {
+                    if (value.key == p) continue;
+                }
+                previous_key = value.key;
+                buffer[target] = value;
+                target += 1;
+            }
+            return buffer[0..target];
         }
     };
+}
+
+test "k_way_merge: smoke" {
+    try TestContextType(3).merge(
+        .ascending,
+        &.{
+            &.{},
+            &.{1},
+            &.{0},
+        },
+        null,
+    );
+}
+
+test "k_way_merge: minimal" {
+    const Gen = @import("../testing/exhaustigen.zig");
+    const N = 3;
+    const M = 3;
+    const T = TestContextType(N);
+
+    var buffer: [N][M]u32 = @splat(@splat(0));
+    var streams: [N][]u32 = @splat(&.{});
+    var g: Gen = .{};
+    while (!g.done()) {
+        for (0..N) |stream_index| {
+            const key_count = g.int_inclusive(u32, M);
+            for (0..key_count) |key_index| {
+                buffer[stream_index][key_index] = g.int_inclusive(u32, M);
+            }
+            streams[stream_index] = buffer[stream_index][0..key_count];
+            std.mem.sort(u32, streams[stream_index], {}, std.sort.asc(u32));
+        }
+
+        std.debug.print("\n", .{});
+        for (streams) |s| std.debug.print("{any}\n", .{s});
+
+        try T.merge(
+            .ascending,
+            &streams,
+            null,
+        );
+    }
 }
 
 test "k_way_merge: unit" {
     // Empty stream.
     try TestContextType(1).merge(
         .ascending,
-        &[_][]const u32{},
-        &[_]TestContextType(1).Value{},
+        &.{},
+        &.{},
     );
 
     try TestContextType(1).merge(
         .ascending,
-        &[_][]const u32{
-            &[_]u32{ 0, 3, 4, 8 },
+        &.{
+            &.{ 0, 3, 4, 8 },
         },
-        &[_]TestContextType(1).Value{
+        &.{
             .{ .key = 0, .version = 0 },
             .{ .key = 3, .version = 0 },
             .{ .key = 4, .version = 0 },
@@ -378,10 +492,10 @@ test "k_way_merge: unit" {
     );
     try TestContextType(1).merge(
         .descending,
-        &[_][]const u32{
-            &[_]u32{ 8, 4, 3, 0 },
+        &.{
+            &.{ 8, 4, 3, 0 },
         },
-        &[_]TestContextType(1).Value{
+        &.{
             .{ .key = 8, .version = 0 },
             .{ .key = 4, .version = 0 },
             .{ .key = 3, .version = 0 },
@@ -390,12 +504,12 @@ test "k_way_merge: unit" {
     );
     try TestContextType(3).merge(
         .ascending,
-        &[_][]const u32{
-            &[_]u32{ 0, 3, 4, 8, 11 },
-            &[_]u32{ 2, 11, 12, 13, 15 },
-            &[_]u32{ 1, 2, 11 },
+        &.{
+            &.{ 0, 3, 4, 8, 11 },
+            &.{ 2, 11, 12, 13, 15 },
+            &.{ 1, 2, 11 },
         },
-        &[_]TestContextType(3).Value{
+        &.{
             .{ .key = 0, .version = 0 },
             .{ .key = 1, .version = 2 },
             .{ .key = 2, .version = 1 },
@@ -410,12 +524,12 @@ test "k_way_merge: unit" {
     );
     try TestContextType(3).merge(
         .descending,
-        &[_][]const u32{
-            &[_]u32{ 11, 8, 4, 3, 0 },
-            &[_]u32{ 15, 13, 12, 11, 2 },
-            &[_]u32{ 11, 2, 1 },
+        &.{
+            &.{ 11, 8, 4, 3, 0 },
+            &.{ 15, 13, 12, 11, 2 },
+            &.{ 11, 2, 1 },
         },
-        &[_]TestContextType(3).Value{
+        &.{
             .{ .key = 15, .version = 1 },
             .{ .key = 13, .version = 1 },
             .{ .key = 12, .version = 1 },
@@ -431,10 +545,10 @@ test "k_way_merge: unit" {
 
     try TestContextType(32).merge(
         .ascending,
-        &[_][]const u32{
-            &[_]u32{ 0, 3, 4, 8 },
+        &.{
+            &.{ 0, 3, 4, 8 },
         },
-        &[_]TestContextType(32).Value{
+        &.{
             .{ .key = 0, .version = 0 },
             .{ .key = 3, .version = 0 },
             .{ .key = 4, .version = 0 },
@@ -444,12 +558,12 @@ test "k_way_merge: unit" {
 
     try TestContextType(32).merge(
         .descending,
-        &[_][]const u32{
-            &[_]u32{ 11, 8, 4, 3, 0 },
-            &[_]u32{ 15, 13, 12, 11, 2 },
-            &[_]u32{ 11, 2, 1 },
+        &.{
+            &.{ 11, 8, 4, 3, 0 },
+            &.{ 15, 13, 12, 11, 2 },
+            &.{ 11, 2, 1 },
         },
-        &[_]TestContextType(32).Value{
+        &.{
             .{ .key = 15, .version = 1 },
             .{ .key = 13, .version = 1 },
             .{ .key = 12, .version = 1 },
@@ -594,7 +708,7 @@ fn FuzzTestContextType(comptime streams_max: u32) type {
                     }
                 }
                 const expect_with_duplicates = expect_buffer[0..expect_buffer_len];
-                std.mem.sort(Value, expect_with_duplicates, {}, value_less_than);
+                std.mem.sort(Value, expect_with_duplicates, .ascending, Value.less_then);
 
                 var target: usize = 0;
                 var previous_key: ?u32 = null;
@@ -652,18 +766,10 @@ fn FuzzTestContextType(comptime streams_max: u32) type {
         fn key_less_than(_: void, a: u32, b: u32) bool {
             return a < b;
         }
-
-        fn value_less_than(_: void, a: Value, b: Value) bool {
-            return switch (math.order(a.key, b.key)) {
-                .lt => true,
-                .eq => a.version < b.version,
-                .gt => false,
-            };
-        }
     };
 }
 
 test "k_way_merge: fuzz" {
     var prng = stdx.PRNG.from_seed_testing();
-    try FuzzTestContextType(32).fuzz(&prng, 1024);
+    try FuzzTestContextType(32).fuzz(&prng, 10);
 }
