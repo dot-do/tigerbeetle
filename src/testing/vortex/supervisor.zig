@@ -47,7 +47,6 @@ const constants = @import("constants.zig");
 const Progress = @import("./workload.zig").Progress;
 const ratio = stdx.PRNG.ratio;
 const Shell = @import("../../shell.zig");
-const TimeOS = @import("../../time.zig").TimeOS;
 
 const log = std.log.scoped(.supervisor);
 const tigerbeetle_exe_default: []const u8 = @import("vortex_options").tigerbeetle_exe;
@@ -251,10 +250,6 @@ const Supervisor = struct {
         var terminated_replicas_buffer: [constants.vsr.replicas_max]ReplicaWithIndex = undefined;
         var paused_replicas_buffer: [constants.vsr.replicas_max]ReplicaWithIndex = undefined;
 
-        var time_os: TimeOS = .{};
-        var time = time_os.time();
-        var monotonic_last = time.monotonic();
-
         var sleep_deadline: u64 = 0;
         // This represents the start timestamp of a period where we have an acceptable number of
         // process faults, such that we require liveness (that requests are finished within a
@@ -277,17 +272,6 @@ const Supervisor = struct {
                 replicas_in_state(supervisor.replicas, &paused_replicas_buffer, .paused);
 
             const faulty_replica_count = terminated_replicas.len + paused_replicas.len;
-
-            const monotonic = time.monotonic();
-            defer monotonic_last = monotonic;
-
-            // If we were asleep much longer than we expected, then our liveness timer is wrong.
-            // (Most likely cause: CFO was busying compiling fuzzers so we were blocked on writing
-            // to stdout).
-            // TODO Remove when CFO compiles fast enough that it is not an issue.
-            if (monotonic.duration_since(monotonic_last).ns > 30 * std.time.ns_per_s) {
-                acceptable_faults_start_ns = null;
-            }
 
             if (acceptable_faults_start_ns) |start_ns| {
                 const deadline = start_ns + constants.vortex.liveness_requirement_seconds *
