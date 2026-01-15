@@ -436,9 +436,6 @@ fn run_fuzzers(
                                 const log_data = try gpa.alloc(u8, log_size_max);
                                 errdefer gpa.free(log_data);
 
-                                try shell.pushd(task.working_directory);
-                                defer shell.popd();
-
                                 const log_file = try shell.cwd.openFile(fuzzer.log.?, .{});
                                 defer log_file.close();
 
@@ -462,10 +459,6 @@ fn run_fuzzers(
                     task.runtime_total_ns += seed_duration_ns;
 
                     if (fuzzer.log) |log_path| {
-                        // FIXME This is awkward!
-                        try shell.pushd(task.working_directory);
-                        defer shell.popd();
-
                         shell.cwd.deleteFile(log_path) catch |err| {
                             log.warn("error deleting log file: {} {s}", .{ err, log_path });
                         };
@@ -979,7 +972,10 @@ fn run_fuzzers_start_fuzzer(shell: *Shell, options: struct {
     return .{
         .command = command,
         .process = process,
-        .log = log_path,
+        .log = if (log_path) |path|
+            try shell.fmt("{s}/{s}", .{ options.working_directory, path })
+        else
+            null,
     };
 }
 
