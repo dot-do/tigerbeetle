@@ -13,6 +13,21 @@ const VoprLog = enum { short, full };
 fn resolve_target(b: *std.Build, target_requested: ?[]const u8) !std.Build.ResolvedTarget {
     const target_host = @tagName(builtin.target.cpu.arch) ++ "-" ++ @tagName(builtin.target.os.tag);
     const target = target_requested orelse target_host;
+
+    // WASM targets for Cloudflare Workers / browser environments
+    // Note: wasm64 is preferred for TigerBeetle as it assumes 64-bit pointer architecture
+    if (std.mem.eql(u8, target, "wasm32-freestanding") or
+        std.mem.eql(u8, target, "wasm32-wasi") or
+        std.mem.eql(u8, target, "wasm64-freestanding") or
+        std.mem.eql(u8, target, "wasm64-wasi"))
+    {
+        const query = try Query.parse(.{
+            .arch_os_abi = target,
+            .cpu_features = "baseline",
+        });
+        return b.resolveTargetQuery(query);
+    }
+
     const triples = .{
         "aarch64-linux",
         "aarch64-macos",
@@ -206,140 +221,147 @@ pub fn build(b: *std.Build) !void {
     });
 
     // zig build test -- "test filter"
-    try build_test(b, .{
-        .test_unit = build_steps.test_unit,
-        .test_unit_build = build_steps.test_unit_build,
-        .test_integration = build_steps.test_integration,
-        .test_integration_build = build_steps.test_integration_build,
-        .test_fmt = build_steps.test_fmt,
-        .@"test" = build_steps.@"test",
-    }, .{
-        .stdx_module = stdx_module,
-        .vsr_options = vsr_options,
-        .llvm_objcopy = build_options.llvm_objcopy,
-        .tb_client_header = tb_client.header,
-        .target = target,
-        .mode = mode,
-    });
+    // Skip tests for WASM targets - they don't support integration tests
+    const is_wasm_target = target.result.cpu.arch == .wasm32 or target.result.cpu.arch == .wasm64;
+    if (!is_wasm_target) {
+        try build_test(b, .{
+            .test_unit = build_steps.test_unit,
+            .test_unit_build = build_steps.test_unit_build,
+            .test_integration = build_steps.test_integration,
+            .test_integration_build = build_steps.test_integration_build,
+            .test_fmt = build_steps.test_fmt,
+            .@"test" = build_steps.@"test",
+        }, .{
+            .stdx_module = stdx_module,
+            .vsr_options = vsr_options,
+            .llvm_objcopy = build_options.llvm_objcopy,
+            .tb_client_header = tb_client.header,
+            .target = target,
+            .mode = mode,
+        });
+    }
 
-    // zig build test:jni
-    try build_test_jni(b, build_steps.test_jni, .{
-        .target = target,
-        .mode = mode,
-    });
+    // Skip native-only build steps for WASM targets
+    if (!is_wasm_target) {
+        // zig build test:jni
+        try build_test_jni(b, build_steps.test_jni, .{
+            .target = target,
+            .mode = mode,
+        });
 
-    // zig build vopr -- 42
-    build_vopr(b, .{
-        .vopr_build = build_steps.vopr_build,
-        .vopr_run = build_steps.vopr,
-    }, .{
-        .stdx_module = stdx_module,
-        .vsr_options = vsr_options,
-        .target = target,
-        .mode = mode,
-        .print_exe = build_options.print_exe,
-        .vopr_state_machine = build_options.vopr_state_machine,
-        .vopr_log = build_options.vopr_log,
-    });
+        // zig build vopr -- 42
+        build_vopr(b, .{
+            .vopr_build = build_steps.vopr_build,
+            .vopr_run = build_steps.vopr,
+        }, .{
+            .stdx_module = stdx_module,
+            .vsr_options = vsr_options,
+            .target = target,
+            .mode = mode,
+            .print_exe = build_options.print_exe,
+            .vopr_state_machine = build_options.vopr_state_machine,
+            .vopr_log = build_options.vopr_log,
+        });
 
-    // zig build fuzz -- --events-max=100 lsm_tree 123
-    build_fuzz(b, .{
-        .fuzz = build_steps.fuzz,
-        .fuzz_build = build_steps.fuzz_build,
-    }, .{
-        .stdx_module = stdx_module,
-        .vsr_options = vsr_options,
-        .target = target,
-        .mode = mode,
-        .print_exe = build_options.print_exe,
-    });
+        // zig build fuzz -- --events-max=100 lsm_tree 123
+        build_fuzz(b, .{
+            .fuzz = build_steps.fuzz,
+            .fuzz_build = build_steps.fuzz_build,
+        }, .{
+            .stdx_module = stdx_module,
+            .vsr_options = vsr_options,
+            .target = target,
+            .mode = mode,
+            .print_exe = build_options.print_exe,
+        });
 
-    // zig build scripts -- ci --language=java
-    const scripts = build_scripts(b, .{
-        .scripts = build_steps.scripts,
-        .scripts_build = build_steps.scripts_build,
-    }, .{
-        .stdx_module = stdx_module,
-        .vsr_options = vsr_options,
-        .target = target,
-    });
+        // zig build scripts -- ci --language=java
+        const scripts = build_scripts(b, .{
+            .scripts = build_steps.scripts,
+            .scripts_build = build_steps.scripts_build,
+        }, .{
+            .stdx_module = stdx_module,
+            .vsr_options = vsr_options,
+            .target = target,
+        });
 
-    // zig build vortex
-    build_vortex(b, .{
-        .vortex_build = build_steps.vortex_build,
-        .vortex_run = build_steps.vortex,
-    }, .{
-        .stdx_module = stdx_module,
-        .vsr_module = vsr_module,
-        .vsr_options = vsr_options,
-        .target = target,
-        .mode = mode,
-        .tb_client_header = tb_client.header,
-        .print_exe = build_options.print_exe,
-    });
+        // zig build vortex
+        build_vortex(b, .{
+            .vortex_build = build_steps.vortex_build,
+            .vortex_run = build_steps.vortex,
+        }, .{
+            .stdx_module = stdx_module,
+            .vsr_module = vsr_module,
+            .vsr_options = vsr_options,
+            .target = target,
+            .mode = mode,
+            .tb_client_header = tb_client.header,
+            .print_exe = build_options.print_exe,
+        });
 
-    // zig build clients:$lang
-    build_rust_client(b, build_steps.clients_rust, .{
-        .vsr_module = vsr_module,
-        .vsr_options = vsr_options,
-        .tb_client_header = tb_client.header,
-        .mode = mode,
-    });
-    build_go_client(b, build_steps.clients_go, .{
-        .vsr_module = vsr_module,
-        .vsr_options = vsr_options,
-        .tb_client_header = tb_client.header,
-        .mode = mode,
-    });
-    build_java_client(b, build_steps.clients_java, .{
-        .vsr_module = vsr_module,
-        .vsr_options = vsr_options,
-        .mode = mode,
-    });
-    build_dotnet_client(b, build_steps.clients_dotnet, .{
-        .vsr_module = vsr_module,
-        .vsr_options = vsr_options,
-        .tb_client = tb_client,
-        .mode = mode,
-    });
-    build_node_client(b, build_steps.clients_node, .{
-        .vsr_module = vsr_module,
-        .vsr_options = vsr_options,
-        .mode = mode,
-    });
-    build_python_client(b, build_steps.clients_python, .{
-        .vsr_module = vsr_module,
-        .vsr_options = vsr_options,
-        .tb_client = tb_client,
-        .mode = mode,
-    });
-    build_c_client(b, build_steps.clients_c, .{
-        .vsr_module = vsr_module,
-        .vsr_options = vsr_options,
-        .tb_client_header = tb_client.header,
-        .mode = mode,
-    });
+        // zig build clients:$lang
+        build_rust_client(b, build_steps.clients_rust, .{
+            .vsr_module = vsr_module,
+            .vsr_options = vsr_options,
+            .tb_client_header = tb_client.header,
+            .mode = mode,
+        });
+        build_go_client(b, build_steps.clients_go, .{
+            .vsr_module = vsr_module,
+            .vsr_options = vsr_options,
+            .tb_client_header = tb_client.header,
+            .mode = mode,
+        });
+        build_java_client(b, build_steps.clients_java, .{
+            .vsr_module = vsr_module,
+            .vsr_options = vsr_options,
+            .mode = mode,
+        });
+        build_dotnet_client(b, build_steps.clients_dotnet, .{
+            .vsr_module = vsr_module,
+            .vsr_options = vsr_options,
+            .tb_client = tb_client,
+            .mode = mode,
+        });
+        build_node_client(b, build_steps.clients_node, .{
+            .vsr_module = vsr_module,
+            .vsr_options = vsr_options,
+            .mode = mode,
+        });
+        build_python_client(b, build_steps.clients_python, .{
+            .vsr_module = vsr_module,
+            .vsr_options = vsr_options,
+            .tb_client = tb_client,
+            .mode = mode,
+        });
+        build_c_client(b, build_steps.clients_c, .{
+            .vsr_module = vsr_module,
+            .vsr_options = vsr_options,
+            .tb_client_header = tb_client.header,
+            .mode = mode,
+        });
 
-    // zig build clients:c:sample
-    build_clients_c_sample(b, build_steps.clients_c_sample, .{
-        .vsr_module = vsr_module,
-        .vsr_options = vsr_options,
-        .target = target,
-        .mode = mode,
-    });
+        // zig build clients:c:sample
+        build_clients_c_sample(b, build_steps.clients_c_sample, .{
+            .vsr_module = vsr_module,
+            .vsr_options = vsr_options,
+            .target = target,
+            .mode = mode,
+        });
 
-    // zig build docs
-    build_steps.docs.dependOn(blk: {
-        const nested_build = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
-        nested_build.setCwd(b.path("./src/docs_website/"));
-        break :blk &nested_build.step;
-    });
+        // zig build docs
+        build_steps.docs.dependOn(blk: {
+            const nested_build = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
+            nested_build.setCwd(b.path("./src/docs_website/"));
+            break :blk &nested_build.step;
+        });
 
-    // zig build ci
-    build_ci(b, build_steps.ci, .{
-        .scripts = scripts,
-        .git_commit = build_options.git_commit,
-    });
+        // zig build ci
+        build_ci(b, build_steps.ci, .{
+            .scripts = scripts,
+            .git_commit = build_options.git_commit,
+        });
+    }
 }
 
 fn build_vsr_module(b: *std.Build, options: struct {
@@ -567,10 +589,17 @@ fn build_check(
         mode: std.builtin.OptimizeMode,
     },
 ) void {
+    // Use WASM-specific entry point for WASM targets (avoids CLI/networking dependencies)
+    const is_wasm = options.target.result.cpu.arch == .wasm32 or options.target.result.cpu.arch == .wasm64;
+    const root_source = if (is_wasm)
+        b.path("src/tigerbeetle/wasm_main.zig")
+    else
+        b.path("src/tigerbeetle/main.zig");
+
     const tigerbeetle = b.addExecutable(.{
         .name = "tigerbeetle",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tigerbeetle/main.zig"),
+            .root_source_file = root_source,
             .target = options.target,
             .optimize = options.mode,
         }),
@@ -656,8 +685,15 @@ fn build_tigerbeetle_executable(b: *std.Build, options: struct {
     target: std.Build.ResolvedTarget,
     mode: std.builtin.OptimizeMode,
 }) *std.Build.Step.Compile {
+    // Use WASM-specific entry point for WASM targets
+    const is_wasm = options.target.result.cpu.arch == .wasm32 or options.target.result.cpu.arch == .wasm64;
+    const root_source = if (is_wasm)
+        b.path("src/tigerbeetle/wasm_main.zig")
+    else
+        b.path("src/tigerbeetle/main.zig");
+
     const root_module = b.createModule(.{
-        .root_source_file = b.path("src/tigerbeetle/main.zig"),
+        .root_source_file = root_source,
         .target = options.target,
         .optimize = options.mode,
     });
@@ -669,6 +705,12 @@ fn build_tigerbeetle_executable(b: *std.Build, options: struct {
         .name = "tigerbeetle",
         .root_module = root_module,
     });
+
+    // For WASM, we're building a library without an entry point
+    if (is_wasm) {
+        tigerbeetle.entry = .disabled;
+        tigerbeetle.rdynamic = true; // Export all symbols
+    }
 
     return tigerbeetle;
 }

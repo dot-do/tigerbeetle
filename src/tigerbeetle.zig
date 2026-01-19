@@ -941,9 +941,10 @@ pub const Operation = enum(u8) {
 
 comptime {
     const target = builtin.target;
+    const is_wasm = target.cpu.arch == .wasm32 or target.cpu.arch == .wasm64;
 
-    if (target.os.tag != .linux and !target.os.tag.isDarwin() and target.os.tag != .windows) {
-        @compileError("linux, windows or macos is required for io");
+    if (!is_wasm and target.os.tag != .linux and !target.os.tag.isDarwin() and target.os.tag != .windows) {
+        @compileError("linux, windows or macos is required for io (or WASM for freestanding)");
     }
 
     // We require little-endian architectures everywhere for efficient network deserialization:

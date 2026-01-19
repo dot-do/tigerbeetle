@@ -10,7 +10,12 @@ const assert = std.debug.assert;
 const is_darwin = builtin.target.os.tag.isDarwin();
 const is_windows = builtin.target.os.tag == .windows;
 const is_linux = builtin.target.os.tag == .linux;
+const is_wasm = builtin.target.cpu.arch == .wasm32 or builtin.target.cpu.arch == .wasm64;
 const Instant = stdx.Instant;
+
+// WASM time imports from JavaScript VFS
+extern "env" fn vfs_time_monotonic() u64;
+extern "env" fn vfs_time_realtime() i64;
 
 pub const Time = struct {
     context: *anyopaque,
@@ -63,6 +68,7 @@ pub const TimeOS = struct {
         const self: *TimeOS = @ptrCast(@alignCast(context));
 
         const m = blk: {
+            if (is_wasm) break :blk vfs_time_monotonic();
             if (is_windows) break :blk monotonic_windows();
             if (is_darwin) break :blk monotonic_darwin();
             if (is_linux) break :blk monotonic_linux();
@@ -142,6 +148,7 @@ pub const TimeOS = struct {
     }
 
     fn realtime(_: *anyopaque) i64 {
+        if (is_wasm) return vfs_time_realtime();
         if (is_windows) return realtime_windows();
         // macos has supported clock_gettime() since 10.12:
         // https://opensource.apple.com/source/Libc/Libc-1158.1.2/gen/clock_gettime.3.auto.html

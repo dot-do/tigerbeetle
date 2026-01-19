@@ -50,7 +50,11 @@ comptime {
     //
     // If you're trying to compile TigerBeetle for an older CPU without AES hardware acceleration,
     // you'll need to disable the following assert.
-    assert(std.crypto.core.aes.has_hardware_support);
+    //
+    // For WASM builds, we use the software fallback - performance is acceptable for edge use cases.
+    if (builtin.target.cpu.arch != .wasm32 and builtin.target.cpu.arch != .wasm64) {
+        assert(std.crypto.core.aes.has_hardware_support);
+    }
 }
 
 fn seed_init() void {

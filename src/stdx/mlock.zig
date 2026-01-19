@@ -24,6 +24,10 @@ pub fn memory_lock_allocated(options: struct { allocated_size: usize }) MemoryLo
             // such as the stack, globals, etc.
         },
         .windows => try memory_lock_allocated_windows(options.allocated_size),
+        .freestanding => {
+            // WASM doesn't have memory locking - memory is managed by the JS runtime.
+            // This is acceptable for edge deployments where the entire DO is memory-resident.
+        },
         else => @compileError("unsupported platform"),
     }
 }
